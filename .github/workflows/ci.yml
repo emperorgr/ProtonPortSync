@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  parse:
+    name: PowerShell syntax check
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Parse every PowerShell script
+        shell: powershell
+        run: |
+          $failed = $false
+          $files = Get-ChildItem -Path . -Filter *.ps1 -Recurse -File
+
+          foreach ($file in $files) {
+            $parseErrors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              $file.FullName, [ref]$null, [ref]$parseErrors)
+
+            if ($parseErrors -and $parseErrors.Count -gt 0) {
+              $first = $parseErrors[0]
+              Write-Host "::error file=$($file.FullName),line=$($first.Extent.StartLineNumber)::$($first.Message)"
+              $failed = $true
+            }
+            else {
+              Write-Host "OK   $($file.Name)"
+            }
+          }
+
+          Write-Host ""
+          Write-Host "Parsed $($files.Count) script(s)."
+          if ($failed) { exit 1 }
+
+      - name: Ensure generated files are not committed
+        shell: powershell
+        run: |
+          $bad = @('ProtonPortSync.vbs', 'config.json')
+          foreach ($name in $bad) {
+            if (Test-Path -LiteralPath $name) {
+              Write-Host "::error::$name is generated locally and must not be committed"
+              exit 1
+            }
+          }
+          Write-Host "No generated files present."
