@@ -1,0 +1,7 @@
+# Generated at setup time - contains absolute paths, never commit it
+ProtonPortSync.vbs
+
+# Local configuration / logs (normally stored in %LOCALAPPDATA%, ignored defensively)
+config.json
+*.log
+*.log.old
