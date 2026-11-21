@@ -33,17 +33,27 @@ function Write-Step { param($t) Write-Host "`n== $t" -ForegroundColor Cyan }
 Write-Step 'qBittorrent WebUI'
 
 if (-not $PSBoundParameters.ContainsKey('WebUiUrl')) {
-    $input = Read-Host "WebUI URL [$WebUiUrl]"
-    if ($input) { $WebUiUrl = $input }
+    $answer = Read-Host "WebUI URL [$WebUiUrl]"
+    if ($answer) { $WebUiUrl = $answer }
 }
 $WebUiUrl = $WebUiUrl.TrimEnd('/')
-
-if (-not $PSBoundParameters.ContainsKey('Username')) {
-    $input = Read-Host "Username [$Username]"
-    if ($input) { $Username = $input }
+if ($WebUiUrl -match '^http://' -and $WebUiUrl -notmatch '^http://(127\.0\.0\.1|localhost|\[::1\])([:/]|$)') {
+    Write-Host 'Warning: this WebUI URL is plain HTTP on a non-local address; the password will be sent unencrypted.' -ForegroundColor Yellow
 }
 
-if (-not $PSBoundParameters.ContainsKey('Password')) {
+if (-not $PSBoundParameters.ContainsKey('Username')) {
+    $answer = Read-Host "Username [$Username]"
+    if ($answer) { $Username = $answer }
+}
+
+if (-not $PSBoundParameters.ContainsKey('Password') -and $env:PROTONPORTSYNC_PASSWORD) {
+    $Password = $env:PROTONPORTSYNC_PASSWORD   # keeps the password out of the command line / history
+}
+elseif ($PSBoundParameters.ContainsKey('Password')) {
+    Write-Host 'Note: -Password on the command line can end up in shell history. Prefer the prompt or $env:PROTONPORTSYNC_PASSWORD.' -ForegroundColor Yellow
+}
+
+if (-not $Password) {
     $secure = Read-Host 'Password' -AsSecureString
     $bstr   = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
     try   { $Password = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }

@@ -74,11 +74,15 @@ by your Windows account on this machine, never stored in plaintext.
 `-RegisterStartup` installs a hidden logon task (`ProtonPortSync`) that starts the
 service in the background. Omit it to run manually.
 
-Non-interactive alternative:
+Non-interactive alternative (the password is read from an environment variable so it
+does not end up in your shell history):
 
 ```powershell
-.\ProtonPortSync.Setup.ps1 -WebUiUrl http://127.0.0.1:8080 -Username admin -Password 'yourpass' -RegisterStartup
+$env:PROTONPORTSYNC_PASSWORD = 'yourpass'
+.\ProtonPortSync.Setup.ps1 -WebUiUrl http://127.0.0.1:8080 -Username admin -RegisterStartup
 ```
+
+`-Password 'yourpass'` still works, but Setup warns that it can be recorded in history.
 
 ## Daily use
 
@@ -111,7 +115,9 @@ Steady state is silent on purpose (no repeated lines). A heartbeat is written ev
 | qBittorrent is closed | The service keeps running and retrying; it syncs on the first poll after qBittorrent starts |
 | qBittorrent starts with an outdated port | It loads the old port from its own config, then the service corrects it within ~20 s |
 | Windows reboot / logoff | The logon task restarts the service, which syncs within ~20 s |
-| Service process killed | A 10-minute watchdog trigger relaunches it; a global mutex makes duplicates exit instantly |
+| Service process killed | A 10-minute watchdog trigger relaunches it; a global mutex makes duplicates exit instantly (a mutex left behind by the killed process is taken over cleanly) |
+| Wrong qBittorrent password (401) | Logged once, then login attempts stop so the IP cannot be banned; resumes automatically when `config.json` changes (re-run Setup) |
+| You edit `config.json` | Picked up on the next poll, no restart needed |
 
 The only hard requirement is that the service is running. It starts at logon and is
 supervised by the watchdog, so in normal use nothing else is needed.
@@ -158,7 +164,7 @@ folder is left in place; delete `%LOCALAPPDATA%\ProtonPortSync` to remove it too
 | `ProtonVPN log directory not found` | Re-run Setup and pass the Logs folder, or set `LogDirectory` in config.json. |
 | `No ProtonVPN port announcement found` | VPN not connected, or port forwarding disabled in the ProtonVPN app. |
 | `NAT-PMP did not confirm` | VPN is reconnecting, or you are on a plan without port forwarding. |
-| `401/403` from qBittorrent | Wrong WebUI password (401), or the IP is banned (403). |
+| `401/403` from qBittorrent | Wrong WebUI password (401; the service stops retrying until you re-run Setup), or the IP is banned (403). |
 | Port keeps reverting | Disable **Random port** in qBittorrent's connection settings. |
 
 ### If you ever get banned
@@ -172,6 +178,8 @@ restarting qBittorrent clears it immediately. The service detects a ban and back
 
 * ProtonVPN's log rotates; the tool reads `client-logs*.txt` and always takes the
   newest `Port pair` line, so rotation is handled transparently.
+* A warning is logged if the WebUI URL is plain `http://` on a non-local address, because the
+  password would be sent unencrypted.
 * Only `listen_port` is modified. No other qBittorrent setting is touched.
 * Tested against qBittorrent 5.2.3 / WebAPI v2 and ProtonVPN 3.x logs.
 

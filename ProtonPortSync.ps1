@@ -39,6 +39,8 @@ param(
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security
 
+$script:Version = '1.1.0'
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -135,19 +137,26 @@ function Get-ProtonLogDirectory {
     if ($Config.LogDirectory -and (Test-Path -LiteralPath $Config.LogDirectory)) {
         return $Config.LogDirectory
     }
+    # Reuse the last directory we found while it still exists.
+    if ($script:LogDirCache -and (Test-Path -LiteralPath $script:LogDirCache)) {
+        return $script:LogDirCache
+    }
     $candidates = @(
         (Join-Path $env:LOCALAPPDATA 'Proton\Proton VPN\Logs'),
         (Join-Path $env:APPDATA      'Proton\Proton VPN\Logs'),
         (Join-Path $env:LOCALAPPDATA 'ProtonVPN\Logs')
     )
     foreach ($c in $candidates) {
-        if (Test-Path -LiteralPath $c) { return $c }
+        if (Test-Path -LiteralPath $c) { $script:LogDirCache = $c; return $c }
     }
     # Last resort: search under the user profile for a folder named "Proton VPN\Logs".
+    # This walk is slow, so do it at most once every 5 minutes.
+    if ($script:LogDirNextSearch -and (Get-Date) -lt $script:LogDirNextSearch) { return $null }
+    $script:LogDirNextSearch = (Get-Date).AddMinutes(5)
     $hit = Get-ChildItem -Path $env:LOCALAPPDATA -Directory -Recurse -Depth 4 -ErrorAction SilentlyContinue |
            Where-Object { $_.FullName -like '*Proton VPN\Logs' } |
            Select-Object -First 1
-    if ($hit) { return $hit.FullName }
+    if ($hit) { $script:LogDirCache = $hit.FullName; return $hit.FullName }
     return $null
 }
 
@@ -328,6 +337,11 @@ function New-QbtSession {
     #>
     param($Config)
     $base = $Config.WebUiUrl.TrimEnd('/')
+    if (-not $script:HttpWarned -and $base -match '^http://' -and
+        $base -notmatch '^http://(127\.0\.0\.1|localhost|\[::1\])([:/]|$)') {
+        $script:HttpWarned = $true
+        Write-Log 'WebUI URL is plain HTTP on a non-local address: the password is sent unencrypted. Prefer https:// or a local qBittorrent.' 'WARN'
+    }
     $session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
     $password = Unprotect-String $Config.PasswordProtected
 
@@ -441,6 +455,14 @@ function Invoke-SyncCycle {
     }
 
     # --- qBittorrent -------------------------------------------------------
+    # After a 401 do NOT keep retrying: five bad logins get this IP banned.
+    # Resume only once config.json has been changed (e.g. Setup re-run).
+    if ($script:AuthFailedStamp) {
+        $stamp = (Get-Item -LiteralPath $ConfigPath -ErrorAction SilentlyContinue).LastWriteTimeUtc
+        if ($stamp -eq $script:AuthFailedStamp) { return $false }
+        $script:AuthFailedStamp = $null
+        Write-Log 'Configuration changed; retrying qBittorrent login.'
+    }
     $qbt = $null
     try {
         $qbt = Get-QbtConnection -Config $Config
@@ -487,7 +509,11 @@ function Invoke-SyncCycle {
             $script:BanBackoffUntil = (Get-Date).AddMinutes(5)
             Write-Log $msg 'ERROR'
         }
-        elseif ($msg -match 'rejected the username|Unexpected login') {
+        elseif ($msg -match 'rejected the username') {
+            $script:AuthFailedStamp = (Get-Item -LiteralPath $ConfigPath -ErrorAction SilentlyContinue).LastWriteTimeUtc
+            Write-Log ($msg + ' Not retrying until the configuration changes - re-run ProtonPortSync.Setup.ps1.') 'ERROR'
+        }
+        elseif ($msg -match 'Unexpected login') {
             Write-Log $msg 'ERROR'
         }
         elseif ($msg -match 'unreachable|Unable to connect|refused|timed out') {
@@ -552,7 +578,16 @@ function Invoke-Main {
 
         # --- background loop -----------------------------------------------
         $mutex = New-Object System.Threading.Mutex($false, 'Global\ProtonPortSync')
-        if (-not $mutex.WaitOne(0)) {
+        $acquired = $false
+        try {
+            $acquired = $mutex.WaitOne(0)
+        }
+        catch [System.Threading.AbandonedMutexException] {
+            # The previous instance was killed while holding the mutex. We now own it,
+            # so this is the normal watchdog-restart path, not an error.
+            $acquired = $true
+        }
+        if (-not $acquired) {
             Write-Log 'Another instance is already running. Exiting.' 'WARN'
             return
         }
@@ -560,12 +595,13 @@ function Invoke-Main {
         $interval = if ($IntervalSeconds -gt 0) { $IntervalSeconds } else { [int]$config.IntervalSeconds }
         if ($interval -lt 5) { $interval = 5 }
 
-        Write-Log "ProtonPortSync started (interval ${interval}s, WebUI $($config.WebUiUrl))."
+        Write-Log "ProtonPortSync $script:Version started (interval ${interval}s, WebUI $($config.WebUiUrl))."
 
         $script:Quiet = $true   # from here on, log to file only
 
         $lastHeartbeat = Get-Date
         while ($true) {
+            try { $config = Get-Config } catch { }   # keep the last good config if the file is mid-write
             $inSync = Invoke-SyncCycle -Config $config
 
             # Heartbeat every 30 minutes so "no log output" never looks like a dead service.
