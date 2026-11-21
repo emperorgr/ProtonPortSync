@@ -84,6 +84,37 @@ $env:PROTONPORTSYNC_PASSWORD = 'yourpass'
 
 `-Password 'yourpass'` still works, but Setup warns that it can be recorded in history.
 
+## Updating to a new version
+
+Your settings (`config.json`, the encrypted password) and the log live in
+`%LOCALAPPDATA%\ProtonPortSync`, outside the project folder, so an update never touches them
+and you do **not** need to run Setup again.
+
+1. **Get the new files.** Either `git pull` in the project folder, or download the
+   *Source code (zip)* of the latest [release](https://github.com/emperorgr/ProtonPortSync/releases/latest) and extract it over
+   the old folder (same location, overwrite when asked).
+2. **Stop the running service.** The old version keeps running from memory until you stop it.
+   It is a hidden `powershell.exe`; this command stops only that one:
+
+   ```powershell
+   Get-CimInstance Win32_Process |
+       Where-Object { $_.CommandLine -match 'ProtonPortSync\.ps1' -and $_.ProcessId -ne $PID } |
+       ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+   ```
+3. **Start the new one.** Either wait up to 10 minutes for the watchdog, or start it right away:
+
+   ```powershell
+   Start-ScheduledTask -TaskName ProtonPortSync
+   ```
+4. **Check it.** Run `.\ProtonPortSync.ps1 -Status` (it should say `IN SYNC`), and look for
+   `ProtonPortSync <version> started` in `%LOCALAPPDATA%\ProtonPortSync\ProtonPortSync.log`.
+
+If you **moved the project folder**, run `ProtonPortSync.Setup.ps1 -RegisterStartup` once from
+the new location so the logon task points at it. If you run the service manually instead of
+through the task, just stop it (step 2) and start it again the way you normally do.
+
+See [CHANGELOG.md](CHANGELOG.md) for what changed in each version.
+
 ## Daily use
 
 ```powershell
