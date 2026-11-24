@@ -1,5 +1,13 @@
 # Changelog
 
+## macOS 0.1.0-beta.1 - 2026-11-25 (separate from the Windows version below)
+
+First test build of the macOS version in [`macos/`](macos/README.md). Python 3 standard
+library only. Finds the forwarded port over NAT-PMP, detects the VPN's `utunN` interface and
+sets both in qBittorrent, stores the password in the Keychain and runs as a launchd agent.
+Automated tests pass against mock servers; **not yet verified on a real Mac with ProtonVPN**.
+The Windows scripts are unchanged by this release.
+
 ## 1.1.0 - 2026-11-21
 
 ### Fixed

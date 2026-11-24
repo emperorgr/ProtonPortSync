@@ -5,6 +5,10 @@ port-forwarding port, so you stay connectable without ever touching the port by 
 
 No dependencies: pure Windows PowerShell 5.1 (already on every Windows 10/11 machine).
 
+> **On a Mac?** There is a **beta macOS version** (Python 3, also dependency-free) in
+> [`macos/`](macos/README.md). Besides the port it also follows ProtonVPN's changing `utunN`
+> network interface. It needs testers - see its README.
+
 ---
 
 ## Why a companion service instead of a qBittorrent patch?
