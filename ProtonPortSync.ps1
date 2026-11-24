@@ -39,7 +39,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security
 
-$script:Version = '1.1.0'
+$script:Version = '1.1.1'
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -226,7 +226,7 @@ function Get-ProtonReservedPort {
 
 function Send-NatPmpRequest {
     <#
-        Opcode 0 = external address, 1 = map TCP, 2 = map UDP.
+        Opcode 0 = external address, 1 = map UDP, 2 = map TCP (RFC 6886).
         Returns $null on timeout / error / non-zero result code.
     #>
     param(
@@ -302,9 +302,9 @@ function Test-PortForwarded {
     #>
     param($Config, [int]$Port)
 
-    $tcp = Send-NatPmpRequest -Opcode 1 -InternalPort $Port -SuggestedPort $Port -Lifetime 60 `
+    $udp = Send-NatPmpRequest -Opcode 1 -InternalPort $Port -SuggestedPort $Port -Lifetime 60 `
                               -Gateway $Config.NatPmpGateway -GatewayPort ([int]$Config.NatPmpPort)
-    $udp = Send-NatPmpRequest -Opcode 2 -InternalPort $Port -SuggestedPort $Port -Lifetime 60 `
+    $tcp = Send-NatPmpRequest -Opcode 2 -InternalPort $Port -SuggestedPort $Port -Lifetime 60 `
                               -Gateway $Config.NatPmpGateway -GatewayPort ([int]$Config.NatPmpPort)
 
     $tcpOk = ($tcp -and $tcp.ExternalPort -eq $Port)

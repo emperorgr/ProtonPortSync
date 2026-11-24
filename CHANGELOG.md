@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.1 - 2026-11-25
+
+### Fixed
+- TCP and UDP were swapped in the NAT-PMP check: RFC 6886 defines opcode 1 as UDP and
+  opcode 2 as TCP. The sync itself was never affected (both must succeed), but the
+  `TCP=`/`UDP=` values shown by `-Status` and in log warnings were reversed.
+
 ## macOS 0.1.0-beta.1 - 2026-11-25 (separate from the Windows version below)
 
 First test build of the macOS version in [`macos/`](macos/README.md). Python 3 standard
