@@ -137,7 +137,10 @@ function Select-LatestFromFeed {
 function Select-LatestFromApi {
     param([string]$Json)
     $best = $null
-    foreach ($rel in @($Json | ConvertFrom-Json)) {
+    # Assign first: Windows PowerShell 5.1 emits a JSON array as ONE object, so piping or
+    # wrapping it straight into foreach would iterate once over the whole array.
+    $items = $Json | ConvertFrom-Json
+    foreach ($rel in @($items)) {
         if (-not $rel -or $rel.draft -or $rel.prerelease) { continue }
         $ver = ConvertTo-UpdateVersion ([string]$rel.tag_name)
         if (-not $ver) { continue }

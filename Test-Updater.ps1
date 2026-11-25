@@ -188,7 +188,8 @@ try {
         $r = Invoke-AutoUpdate -Config $null
         Assert-That ($r.Result -eq 'updated') "valid files still install ($($r.Message))"
         $stray = @(Get-ChildItem -LiteralPath $tmp -Recurse -File -Include 'evil.ps1', 'evil.cmd', 'nested.ps1' -ErrorAction SilentlyContinue)
-        Assert-That ($stray.Count -eq 0) 'no file escaped or was extracted from nested paths'
+        Assert-That ($stray.Count -eq 0) ('no file escaped or was extracted from nested paths' +
+            $(if ($stray.Count) { ' - found: ' + (($stray | ForEach-Object { $_.FullName }) -join '; ') } else { '' }))
         Assert-That (-not (Test-Path (Join-Path ([IO.Path]::GetTempPath()) 'evil.ps1'))) 'nothing written to the temp folder'
 
         Write-Host 'Git checkout is never modified'
