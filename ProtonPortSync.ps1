@@ -49,7 +49,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security
 
-$script:Version = '1.2.0'
+$script:Version = '1.2.1'
 
 # Self-updater (optional: the engine works without this file).
 $script:InstallDir = $PSScriptRoot

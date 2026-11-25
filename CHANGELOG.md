@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.1 - 2026-11-25
+
+### Fixed
+- Updater: the GitHub API fallback picked the wrong release on Windows PowerShell 5.1
+  (a JSON list was read as a single item). The normal release-feed path was not affected.
+
 ## 1.2.0 - 2026-11-25
 
 ### Added
