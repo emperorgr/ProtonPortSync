@@ -110,8 +110,12 @@ How it stays safe:
 * A folder that is a **git checkout** is never auto-updated (use `git pull`).
 * The log says what happened: `Updated ProtonPortSync 1.2.0 -> 1.2.1. Restarting.`
 
+**Setup asks you** whether to enable this (default: yes). Skip the question with
+`.\ProtonPortSync.Setup.ps1 -AutoUpdate` or `-NoAutoUpdate`, and re-running Setup keeps your
+earlier answer as the default.
+
 Please note this means the service runs code downloaded from this repository's releases
-(over HTTPS, with your user rights). If you do not want that, turn it off:
+(over HTTPS, with your user rights). If you do not want that, say no in Setup, or turn it off later:
 
 ```json
 "AutoUpdate": false

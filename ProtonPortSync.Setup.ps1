@@ -12,6 +12,8 @@
     .\ProtonPortSync.Setup.ps1
 .EXAMPLE
     .\ProtonPortSync.Setup.ps1 -RegisterStartup
+.EXAMPLE
+    .\ProtonPortSync.Setup.ps1 -RegisterStartup -NoAutoUpdate
 #>
 [CmdletBinding()]
 param(
@@ -21,7 +23,9 @@ param(
     [string]$LogDirectory,
     [string]$ConfigPath = (Join-Path $env:LOCALAPPDATA 'ProtonPortSync\config.json'),
     [switch]$RegisterStartup,
-    [switch]$SkipTest
+    [switch]$SkipTest,
+    [switch]$AutoUpdate,      # turn automatic updates on without asking
+    [switch]$NoAutoUpdate     # turn automatic updates off without asking
 )
 
 $ErrorActionPreference = 'Stop'
@@ -110,6 +114,32 @@ if (-not $SkipTest) {
     }
 }
 
+# --- automatic updates -----------------------------------------------------
+$autoUpdateDefault = $true
+if (Test-Path -LiteralPath $ConfigPath) {
+    try {
+        $previous = (Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json).AutoUpdate
+        if ($null -ne $previous) { $autoUpdateDefault = [bool]$previous }   # keep an earlier choice
+    } catch { }
+}
+if ($NoAutoUpdate) {
+    $autoUpdate = $false
+}
+elseif ($AutoUpdate) {
+    $autoUpdate = $true
+}
+else {
+    Write-Step 'Automatic updates'
+    Write-Host 'ProtonPortSync can check GitHub every 6 hours and install new versions by itself,'
+    Write-Host 'then restart itself. Your settings are never touched, and a version that fails to'
+    Write-Host 'start is rolled back automatically. Choose "n" to update by hand instead.'
+    $hint = if ($autoUpdateDefault) { 'Y/n' } else { 'y/N' }
+    $answer = Read-Host "Install updates automatically? [$hint]"
+    if     ($answer -match '^(y|yes)$') { $autoUpdate = $true }
+    elseif ($answer -match '^(n|no)$')  { $autoUpdate = $false }
+    else                                { $autoUpdate = $autoUpdateDefault }
+}
+
 # --- persist ---------------------------------------------------------------
 Write-Step 'Saving configuration'
 $blob = [Security.Cryptography.ProtectedData]::Protect(
@@ -124,7 +154,7 @@ $config = [pscustomobject]@{
     NatPmpPort        = 5351
     IntervalSeconds   = 20
     LastAppliedPort   = 0
-    AutoUpdate        = $true
+    AutoUpdate        = $autoUpdate
     UpdateCheckHours  = 6
 }
 
@@ -169,8 +199,11 @@ sh.Run "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -F
 }
 
 Write-Host ''
-Write-Host 'Automatic updates are ON: new GitHub releases are installed in the background.' -ForegroundColor Cyan
-Write-Host '  To turn them off set "AutoUpdate": false in config.json.'
+if ($autoUpdate) {
+    Write-Host 'Automatic updates: ON  (change with "AutoUpdate" in config.json)' -ForegroundColor Cyan
+} else {
+    Write-Host 'Automatic updates: OFF (check with .\ProtonPortSync.ps1 -CheckUpdate)' -ForegroundColor Cyan
+}
 Write-Host ''
 Write-Host 'Done.' -ForegroundColor Green
 Write-Host '  Status : .\ProtonPortSync.ps1 -Status'
