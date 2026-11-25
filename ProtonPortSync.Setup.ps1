@@ -124,6 +124,8 @@ $config = [pscustomobject]@{
     NatPmpPort        = 5351
     IntervalSeconds   = 20
     LastAppliedPort   = 0
+    AutoUpdate        = $true
+    UpdateCheckHours  = 6
 }
 
 $dir = Split-Path -Parent $ConfigPath
@@ -166,6 +168,9 @@ sh.Run "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -F
     Write-Host 'Logon task "ProtonPortSync" registered and started.' -ForegroundColor Green
 }
 
+Write-Host ''
+Write-Host 'Automatic updates are ON: new GitHub releases are installed in the background.' -ForegroundColor Cyan
+Write-Host '  To turn them off set "AutoUpdate": false in config.json.'
 Write-Host ''
 Write-Host 'Done.' -ForegroundColor Green
 Write-Host '  Status : .\ProtonPortSync.ps1 -Status'

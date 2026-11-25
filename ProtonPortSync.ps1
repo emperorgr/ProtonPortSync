@@ -23,6 +23,14 @@
 .PARAMETER IntervalSeconds
     Poll interval for the background loop. Default 20.
 
+.PARAMETER CheckUpdate
+    Check GitHub for a newer release and report it, without installing.
+
+.PARAMETER Update
+    Check GitHub and install a newer release now. A running background service is
+    restarted on the new version. (The background service also does this by itself
+    every few hours unless "AutoUpdate" is false in config.json.)
+
 .EXAMPLE
     .\ProtonPortSync.ps1 -Once
 .EXAMPLE
@@ -33,13 +41,23 @@ param(
     [string]$ConfigPath = (Join-Path $env:LOCALAPPDATA 'ProtonPortSync\config.json'),
     [int]$IntervalSeconds = 20,
     [switch]$Once,
-    [switch]$Status
+    [switch]$Status,
+    [switch]$CheckUpdate,
+    [switch]$Update
 )
 
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security
 
-$script:Version = '1.1.1'
+$script:Version = '1.2.0'
+
+# Self-updater (optional: the engine works without this file).
+$script:InstallDir = $PSScriptRoot
+$script:UpdaterLoaded = $false
+$updaterPath = Join-Path $PSScriptRoot 'ProtonPortSync.Updater.ps1'
+if (Test-Path -LiteralPath $updaterPath) {
+    try { . $updaterPath; $script:UpdaterLoaded = $true } catch { }
+}
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -55,6 +73,8 @@ function Get-DefaultConfig {
         NatPmpPort        = 5351
         IntervalSeconds   = 20
         LastAppliedPort   = 0
+        AutoUpdate        = $true         # install new GitHub releases automatically
+        UpdateCheckHours  = 6
     }
 }
 
@@ -538,6 +558,8 @@ function Show-Status {
     Write-Host ''
     Write-Host '  ProtonVPN -> qBittorrent status' -ForegroundColor Cyan
     Write-Host '  --------------------------------'
+    Write-Host ("  Version            : {0} (auto-update {1})" -f $script:Version,
+        $(if (-not $script:UpdaterLoaded) { 'unavailable' } elseif ($Config.AutoUpdate) { 'on' } else { 'off' }))
     Write-Host ("  VPN reachable      : {0}" -f $(if ($vpnIp) { "yes ($vpnIp)" } else { 'no' }))
     if ($found) {
         $age = [int](([datetime]::UtcNow) - $found.TimestampUtc).TotalSeconds
@@ -571,6 +593,22 @@ function Invoke-Main {
             return
         }
 
+        if ($CheckUpdate -or $Update) {
+            if (-not $script:UpdaterLoaded) {
+                Write-Host 'The updater (ProtonPortSync.Updater.ps1) is not present in this folder.' -ForegroundColor Yellow
+                return $false
+            }
+            $u = Invoke-AutoUpdate -Config $config -CheckOnly:([bool]$CheckUpdate)
+            Write-Host $u.Message
+            if ($u.Result -eq 'updated') {
+                $n = Restart-RunningService
+                if ($n -gt 0) { Write-Host 'The background service was restarted on the new version.' }
+                else { Write-Host 'Start the service again (or wait for the 10-minute watchdog) to run the new version.' }
+            }
+            if ($u.Result -eq 'error') { return $false }
+            return
+        }
+
         if ($Once) {
             Write-Log 'Running single sync cycle.'
             return (Invoke-SyncCycle -Config $config)
@@ -599,10 +637,53 @@ function Invoke-Main {
 
         $script:Quiet = $true   # from here on, log to file only
 
+        $updatePending = $false
+        $nextUpdateCheck = $null
+        if ($script:UpdaterLoaded) {
+            try {
+                $pending = Resolve-PendingUpdate
+                if ($pending -eq 'rollback') {
+                    $mutex.ReleaseMutex(); $mutex.Dispose()
+                    [void](Start-ServiceRelaunch)
+                    exit 0
+                }
+                $updatePending = ($pending -eq 'pending')
+                $nextUpdateCheck = Get-NextUpdateCheck -Config $config
+            } catch {
+                Write-Log "Update bookkeeping failed: $($_.Exception.Message)" 'WARN'
+            }
+        }
+
+        $startedAt = Get-Date
         $lastHeartbeat = Get-Date
         while ($true) {
             try { $config = Get-Config } catch { }   # keep the last good config if the file is mid-write
             $inSync = Invoke-SyncCycle -Config $config
+
+            # A freshly installed version is confirmed once it has stayed up for 3 minutes.
+            if ($updatePending -and (((Get-Date) - $startedAt).TotalMinutes -ge 3)) {
+                $updatePending = $false
+                try { Confirm-UpdateHealthy } catch { }
+            }
+
+            # Automatic update check (every UpdateCheckHours; persisted across restarts).
+            if ($script:UpdaterLoaded -and $config.AutoUpdate -and $nextUpdateCheck -and ((Get-Date) -ge $nextUpdateCheck)) {
+                $u = $null
+                try { $u = Invoke-AutoUpdate -Config $config } catch { }
+                if ($u -and $u.Result -eq 'updated') {
+                    Write-Log "$($u.Message) Restarting." 'OK' -Force
+                    $mutex.ReleaseMutex(); $mutex.Dispose()   # free the lock so the new copy can start at once
+                    [void](Start-ServiceRelaunch)
+                    exit 0
+                }
+                if ($u -and $u.Result -eq 'error') {
+                    Write-Log $u.Message 'WARN'
+                    $nextUpdateCheck = Get-NextUpdateCheck -Config $config -AfterError
+                } else {
+                    if ($u) { Write-Log $u.Message 'INFO' }
+                    $nextUpdateCheck = Get-NextUpdateCheck -Config $config
+                }
+            }
 
             # Heartbeat every 30 minutes so "no log output" never looks like a dead service.
             if (((Get-Date) - $lastHeartbeat).TotalMinutes -ge 30) {

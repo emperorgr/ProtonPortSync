@@ -43,6 +43,14 @@ jobs:
           Write-Host "Parsed $($files.Count) script(s)."
           if ($failed) { exit 1 }
 
+      - name: Updater tests (offline simulation)
+        shell: powershell
+        run: .\Test-Updater.ps1
+
+      - name: Updater tests against the real GitHub releases
+        shell: powershell
+        run: .\Test-Updater.ps1 -Live
+
       - name: Ensure generated files are not committed
         shell: powershell
         run: |

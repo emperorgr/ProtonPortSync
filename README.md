@@ -88,7 +88,47 @@ $env:PROTONPORTSYNC_PASSWORD = 'yourpass'
 
 `-Password 'yourpass'` still works, but Setup warns that it can be recorded in history.
 
-## Updating to a new version
+## Updating
+
+### Automatic updates (version 1.2.0 and newer)
+
+The background service checks this project's GitHub releases every 6 hours and installs a
+newer version **by itself, with no prompt and no action from you**. It then restarts itself
+on the new version within seconds. Your settings, encrypted password and logs are never
+touched, and nothing needs to be set up again.
+
+How it stays safe:
+
+* Only plain `vX.Y.Z` releases count. Pre-releases (`v1.3.0-beta.1`) and the macOS test
+  builds (`macos-v...`) are ignored.
+* Before anything is replaced, every downloaded script must parse and the version inside
+  must match the release. A bad download changes nothing.
+* The current files are backed up first (`%LOCALAPPDATA%\ProtonPortSync\backup\<version>`).
+  If the new version fails to start 3 times in a row it is **rolled back automatically** and
+  that version is skipped from then on.
+* Only a fixed list of file names in the project folder is replaced - never anything else.
+* A folder that is a **git checkout** is never auto-updated (use `git pull`).
+* The log says what happened: `Updated ProtonPortSync 1.2.0 -> 1.2.1. Restarting.`
+
+Please note this means the service runs code downloaded from this repository's releases
+(over HTTPS, with your user rights). If you do not want that, turn it off:
+
+```json
+"AutoUpdate": false
+```
+
+in `%LOCALAPPDATA%\ProtonPortSync\config.json` (`"UpdateCheckHours": 6` sets the interval).
+Commands for doing it by hand:
+
+```powershell
+.\ProtonPortSync.ps1 -CheckUpdate   # is a newer version out? (installs nothing)
+.\ProtonPortSync.ps1 -Update        # install it now and restart the background service
+```
+
+> **Upgrading from 1.1.x to 1.2.0 is manual, once:** older versions do not contain the
+> updater. Use the manual steps below. From 1.2.0 on, updates install themselves.
+
+### Manual update (any version)
 
 Your settings (`config.json`, the encrypted password) and the log live in
 `%LOCALAPPDATA%\ProtonPortSync`, outside the project folder, so an update never touches them
@@ -153,6 +193,7 @@ Steady state is silent on purpose (no repeated lines). A heartbeat is written ev
 | Service process killed | A 10-minute watchdog trigger relaunches it; a global mutex makes duplicates exit instantly (a mutex left behind by the killed process is taken over cleanly) |
 | Wrong qBittorrent password (401) | Logged once, then login attempts stop so the IP cannot be banned; resumes automatically when `config.json` changes (re-run Setup) |
 | You edit `config.json` | Picked up on the next poll, no restart needed |
+| A new GitHub release appears | Installed automatically within about 6 hours, service restarts itself (see *Updating*); rolled back if it cannot start |
 
 The only hard requirement is that the service is running. It starts at logon and is
 supervised by the watchdog, so in normal use nothing else is needed.

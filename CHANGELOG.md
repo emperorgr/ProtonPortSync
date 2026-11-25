@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.2.0 - 2026-11-25
+
+### Added
+- **Automatic updates.** The background service checks the GitHub releases every 6 hours
+  (`UpdateCheckHours`) and installs a newer `vX.Y.Z` release on its own, then restarts itself.
+  Safeguards: pre-release and `macos-v...` tags are ignored; the download is validated
+  (every script must parse, version must match the tag) before anything is replaced; a
+  fixed list of file names only; the old files are backed up; a version that fails to start
+  3 times is rolled back and skipped; a git checkout is never touched.
+  Turn off with `"AutoUpdate": false` in `config.json`.
+- `-CheckUpdate` (report only) and `-Update` (install now, restart the service).
+- `-Status` shows the version and whether auto-update is on.
+- `Test-Updater.ps1` (offline simulation of whole update cycles; `-Live` also checks the
+  real GitHub feed) and CI steps that run it on Windows PowerShell 5.1.
+
+### Note
+- Upgrading from 1.1.x to 1.2.0 must be done by hand once (older versions have no updater).
+
 ## 1.1.1 - 2026-11-25
 
 ### Fixed
