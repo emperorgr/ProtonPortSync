@@ -208,6 +208,18 @@ supervised by the watchdog, so in normal use nothing else is needed.
 * qBittorrent → *Options → Connection*: **Network Interface = ProtonVPN**, and **Random port = off**.
 * qBittorrent → *Options → Web UI*: **enabled**, with a username/password.
 
+### Portable qBittorrent (PortableApps etc.)
+
+A portable qBittorrent works exactly like a normal install: ProtonPortSync only talks to
+its Web UI and never touches its files or folder.
+
+* Enable the Web UI once: *Tools -> Options -> Web UI -> Web User Interface (Remote control)*,
+  and set a username and password. It is off by default.
+* Use the same address and port in Setup (default `http://127.0.0.1:8080`).
+* If qBittorrent is not running, the service simply waits and retries until it starts.
+* Moving the portable app to another drive or folder changes nothing. Only the ProtonPortSync
+  folder itself must stay where it was installed.
+
 ## Tests
 
 ```powershell
