@@ -8,6 +8,10 @@ No dependencies: pure Windows PowerShell 5.1 (already on every Windows 10/11 mac
 > **On a Mac?** There is a **beta macOS version** (Python 3, also dependency-free) in
 > [`macos/`](macos/README.md). Besides the port it also follows ProtonVPN's changing `utunN`
 > network interface. It needs testers - see its README.
+>
+> **On Linux?** There is also a **beta Linux version** (Python 3, systemd user service) in
+> [`linux/`](linux/README.md). It works with the Proton VPN app, WireGuard or OpenVPN and
+> needs testers too.
 
 ---
 

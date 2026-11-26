@@ -32,6 +32,15 @@
   opcode 2 as TCP. The sync itself was never affected (both must succeed), but the
   `TCP=`/`UDP=` values shown by `-Status` and in log warnings were reversed.
 
+## Linux 0.1.0-beta.1 - 2026-11-26 (separate from the Windows version)
+
+First test build of the Linux version in [`linux/`](linux/README.md). Python 3 standard library
+only. Same approach as the macOS beta: port from NAT-PMP, automatic detection of the tunnel
+interface (`proton0`, `wg0`, `tun0` ... - never a normal network card), one combined Web UI
+update, never unbinds. Password in the desktop keyring (libsecret) or a mode-600 file;
+systemd user service; XDG folders. Works with the Proton VPN app, WireGuard or OpenVPN.
+Not yet tested on real hardware - testers wanted.
+
 ## macOS 0.1.0-beta.1 - 2026-11-25 (separate from the Windows version below)
 
 First test build of the macOS version in [`macos/`](macos/README.md). Python 3 standard
