@@ -330,17 +330,18 @@ function ConvertTo-MaskedText {
 
 function Get-MaskedConfigJson {
     param($Config)
+    # Placeholders avoid < and > because Windows PowerShell 5.1 would write them as \u003c / \u003e.
     $copy = [ordered]@{}
     foreach ($p in $Config.PSObject.Properties) { $copy[$p.Name] = $p.Value }
     if ($copy.Contains('PasswordProtected')) {
-        $copy['PasswordProtected'] = if ($copy['PasswordProtected']) { '<removed>' } else { '' }
+        $copy['PasswordProtected'] = if ($copy['PasswordProtected']) { '(removed)' } else { '' }
     }
-    if ($copy.Contains('Username') -and $copy['Username']) { $copy['Username'] = '<set>' }
+    if ($copy.Contains('Username') -and $copy['Username']) { $copy['Username'] = '(set)' }
     if ($copy.Contains('WebUiUrl') -and $copy['WebUiUrl']) {
         try {
             $u = [uri][string]$copy['WebUiUrl']
             if ($u.Host -notin @('127.0.0.1', 'localhost', '::1', '[::1]')) {
-                $copy['WebUiUrl'] = '{0}://<remote-host>:{1}' -f $u.Scheme, $u.Port
+                $copy['WebUiUrl'] = '{0}://(remote-host):{1}' -f $u.Scheme, $u.Port
             }
         } catch { }
     }

@@ -216,9 +216,9 @@ try {
 
     $remote = $cfgBase.PSObject.Copy(); $remote.WebUiUrl = 'http://nas.home.example:9090'; $remote.Username = 'alex'
     $mj = Get-MaskedConfigJson -Config $remote
-    Assert-That ($mj -notmatch 'SECRETBLOB' -and $mj -match '<removed>') 'password blob is removed from the config copy'
-    Assert-That ($mj -notmatch 'alex' -and $mj -match '<set>') 'user name is hidden'
-    Assert-That ($mj -notmatch 'nas\.home\.example' -and $mj -match '<remote-host>:9090') 'a remote Web UI host is hidden'
+    Assert-That ($mj -notmatch 'SECRETBLOB' -and $mj -match '\(removed\)') 'password blob is removed from the config copy'
+    Assert-That ($mj -notmatch 'alex' -and $mj -match '\(set\)') 'user name is hidden'
+    Assert-That ($mj -notmatch 'nas\.home\.example' -and $mj -match '\(remote-host\):9090') 'a remote Web UI host is hidden'
     Assert-That ((Get-MaskedConfigJson -Config $cfgBase) -match '127\.0\.0\.1:8080') 'a local Web UI address stays readable'
 
     $data = Join-Path $tmp 'data'; New-Item -ItemType Directory -Path $data | Out-Null
