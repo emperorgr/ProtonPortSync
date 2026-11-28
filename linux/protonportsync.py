@@ -13,6 +13,7 @@ Usage:
     python3 protonportsync.py run          run in the foreground (what systemd runs)
     python3 protonportsync.py install      (re)install the systemd user service - use this to update
     python3 protonportsync.py uninstall    remove the service  (--purge also removes data)
+    python3 protonportsync.py support-bundle   zip with checks, recent log and settings (secrets removed)
     python3 protonportsync.py version
 
 How it works
@@ -25,6 +26,7 @@ How it works
 """
 
 import argparse
+import datetime
 import getpass
 import json
 import logging
@@ -41,13 +43,16 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import http.cookiejar
+import ipaddress
+import platform
+import zipfile
 
 try:
     import fcntl
 except ImportError:  # pragma: no cover - not available on Windows
     fcntl = None
 
-__version__ = '0.1.0-beta.1'
+__version__ = '0.2.0-beta.1'
 SYSFS_NET = '/sys/class/net'
 
 APP_NAME = 'ProtonPortSync'
@@ -62,6 +67,11 @@ DEFAULTS = {
     'interval_seconds': 20,
     'manage_interface': True,
     'last_applied_port': 0,
+    'status_file': True,
+    'on_port_change': '',
+    'port_check': False,
+    'port_check_url': 'https://portcheck.transmissionbt.com/{port}',
+    'port_check_minutes': 30,
 }
 
 NATPMP_TIMEOUT = 2.0      # seconds per attempt (tests lower this)
@@ -70,6 +80,14 @@ NATPMP_LIFETIME = 60
 HTTP_TIMEOUT = 8
 BAN_BACKOFF_SECONDS = 300
 HEARTBEAT_SECONDS = 30 * 60
+STATUS_WRITE_SECONDS = 300
+HOOK_TIMEOUT = 15
+
+PLATFORM_LABEL = 'Linux'
+QBT_OPTIONS = 'Tools > Options'
+TUNNEL_EXAMPLE = 'proton0, wg0, tun0 ...'
+IFACE_LOOKUP_CMD = 'ip -o route get 10.2.0.1'
+EXTRA_LOG_NAMES = ()
 
 OP_ADDRESS, OP_UDP, OP_TCP = 0, 1, 2   # RFC 6886
 
@@ -470,6 +488,15 @@ class State:
         self.http_warned = False
         self.iface_missing_logged = False
         self.warned = set()
+        self.cycle = None
+        self.last_port_change = None
+        self.port_reachable = None
+        self.port_checked_utc = None
+        self.port_checked_port = None
+        self.next_port_check = None
+        self.port_closed_count = 0
+        self.status_signature = None
+        self.status_written_at = 0.0
 
     def warn_once(self, key, message):
         """Log a warning once per condition; re-arm it when the condition clears."""
@@ -495,9 +522,13 @@ def _connect(cfg, state, force=False):
 
 def sync_cycle(cfg, state, config_path):
     """One detection + push cycle. Returns True when qBittorrent is in sync."""
+    state.cycle = new_cycle()
     port = discover_port(cfg)
     if port is None:
+        state.cycle['state'] = 'vpn_down'
         return False
+    state.cycle['vpn_connected'] = True
+    state.cycle['forwarded_port'] = port
     if state.last_port != port:
         state.last_port = port
         log.info('Detected ProtonVPN forwarded port %d (VPN IP %s)', port, get_public_ip(cfg) or 'unknown')
@@ -515,6 +546,7 @@ def sync_cycle(cfg, state, config_path):
     # After a rejected password do NOT keep retrying: five bad logins get this IP banned.
     if state.auth_failed_stamp is not None:
         if _config_stamp(config_path) == state.auth_failed_stamp:
+            state.cycle.update(state='auth_failed', error='qBittorrent rejected the username or password.')
             return False
         state.auth_failed_stamp = None
         log.info('Configuration changed; retrying qBittorrent login.')
@@ -534,6 +566,7 @@ def sync_cycle(cfg, state, config_path):
             client = _connect(cfg, state, force=True)
             prefs = client.preferences()
 
+        state.cycle['qbittorrent_port'] = int(prefs.get('listen_port', 0))
         if prefs.get('random_port'):
             state.warn_once('random_port', 'qBittorrent has "random_port" enabled - it will override this sync. Disable it.')
         else:
@@ -563,6 +596,8 @@ def sync_cycle(cfg, state, config_path):
             if 'listen_port' in changes:
                 if int(after.get('listen_port', 0)) != port:
                     log.error('qBittorrent did not accept the new port (still %s).', after.get('listen_port'))
+                    state.cycle.update(state='error', qbittorrent_port=int(after.get('listen_port', 0)),
+                                       error='qBittorrent did not accept the new port.')
                     return False
             if 'current_network_interface' in changes and after.get('current_network_interface') != iface:
                 log.warning('qBittorrent did not accept network interface "%s" (still "%s").',
@@ -573,7 +608,12 @@ def sync_cycle(cfg, state, config_path):
             if 'current_network_interface' in changes:
                 parts.append('network interface "%s" -> "%s"' % (current_iface, iface))
             log.log(OK_LEVEL, 'Updated qBittorrent: %s', ', '.join(parts))
+            state.cycle['qbittorrent_port'] = int(after.get('listen_port', 0))
+            if 'listen_port' in changes:
+                state.last_port_change = _iso(time.time())
+                run_hook(cfg, int(prefs.get('listen_port', 0)), port)
 
+        state.cycle.update(state='in_sync', in_sync=True)
         if cfg.get('last_applied_port') != port:
             cfg['last_applied_port'] = port
             try:
@@ -583,21 +623,387 @@ def sync_cycle(cfg, state, config_path):
         return True
 
     except QbtBanned as exc:
+        state.cycle.update(state='qbt_banned', error=str(exc))
         state.ban_until = time.time() + BAN_BACKOFF_SECONDS
         log.error('%s', exc)
     except QbtAuthError as exc:
+        state.cycle.update(state='auth_failed', error=str(exc))
         state.auth_failed_stamp = _config_stamp(config_path)
         state.qbt = None
         log.error('%s Not retrying until the configuration changes - run "setup" again.', exc)
     except QbtUnreachable as exc:
+        state.cycle.update(state='qbt_unreachable', error=str(exc))
         state.qbt = None
         log.warning('%s', exc)
     except ConfigError as exc:
+        state.cycle.update(state='error', error=str(exc))
         log.error('%s', exc)
     except QbtError as exc:
+        state.cycle.update(state='error', error=str(exc))
         state.qbt = None
         log.error('qBittorrent sync failed: %s', exc)
     return False
+
+
+# --------------------------------------------------------------------------- status file, hook, checks, bundle
+
+def status_path(config_path):
+    return os.path.join(os.path.dirname(os.path.abspath(config_path)), 'status.json')
+
+
+def _iso(epoch):
+    return datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+def new_cycle():
+    return {'state': 'starting', 'in_sync': False, 'vpn_connected': False,
+            'forwarded_port': None, 'qbittorrent_port': None, 'error': None}
+
+
+def write_status(cfg, state, path, force=False, now=None):
+    """Write status.json. Only rewritten when something besides the timestamp changed,
+    or every STATUS_WRITE_SECONDS, to avoid needless disk writes."""
+    if not cfg.get('status_file', True) or not state.cycle:
+        return
+    cyc = state.cycle
+    data = {
+        'version': __version__,
+        'state': cyc['state'],
+        'inSync': bool(cyc['in_sync']),
+        'vpnConnected': bool(cyc['vpn_connected']),
+        'forwardedPort': cyc['forwarded_port'],
+        'qbittorrentPort': cyc['qbittorrent_port'],
+        'lastPortChangeUtc': state.last_port_change,
+        'lastError': cyc['error'],
+        'portReachable': state.port_reachable,
+        'portCheckedUtc': state.port_checked_utc,
+    }
+    signature = json.dumps(data, sort_keys=True)
+    now = time.time() if now is None else now
+    if (not force and signature == state.status_signature
+            and now - state.status_written_at < STATUS_WRITE_SECONDS):
+        return
+    data['updatedUtc'] = _iso(now)
+    try:
+        tmp = path + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as fh:
+            json.dump(data, fh, indent=2)
+            fh.write('\n')
+        os.replace(tmp, path)
+        state.status_signature = signature
+        state.status_written_at = now
+    except OSError:
+        pass
+
+
+def run_hook(cfg, old_port, new_port):
+    """Run the program named in on_port_change after qBittorrent accepted a new port.
+    The details arrive in environment variables: PPS_EVENT, PPS_NEW_PORT, PPS_OLD_PORT, PPS_VERSION."""
+    raw = str(cfg.get('on_port_change') or '').strip().strip('"')
+    if not raw:
+        return
+    if not os.path.isabs(raw) or not os.path.isfile(raw):
+        log.warning('on_port_change: file not found: %s (give the full path to a script or program).', raw)
+        return
+    if raw.endswith('.py'):
+        argv = [sys.executable or 'python3', raw]
+    elif os.access(raw, os.X_OK):
+        argv = [raw]
+    else:
+        log.warning('on_port_change: %s is not executable (run chmod +x on it, or use a .py file).', raw)
+        return
+    env = dict(os.environ, PPS_EVENT='port_changed', PPS_NEW_PORT=str(new_port),
+               PPS_OLD_PORT=str(old_port), PPS_VERSION=__version__)
+    try:
+        proc = subprocess.run(argv, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, timeout=HOOK_TIMEOUT)
+        if proc.returncode != 0:
+            log.warning('on_port_change: %s exited with code %d.', raw, proc.returncode)
+        else:
+            log.info('on_port_change: ran %s.', raw)
+    except subprocess.TimeoutExpired:
+        log.warning('on_port_change: %s did not finish within %d seconds and was stopped.', raw, HOOK_TIMEOUT)
+    except OSError as exc:
+        log.warning('on_port_change: could not run %s - %s', raw, exc)
+
+
+def fetch_text(url, timeout=10):
+    """Small GET returning text, or None on any failure (tests replace this)."""
+    try:
+        request = urllib.request.Request(url, headers={'User-Agent': 'ProtonPortSync/%s' % __version__})
+        with urllib.request.urlopen(request, timeout=timeout) as resp:
+            return resp.read(200).decode('ascii', 'replace')
+    except Exception:
+        return None
+
+
+def check_port_reachable(cfg, port):
+    """True = open, False = closed, None = unknown (service unavailable or odd answer)."""
+    template = str(cfg.get('port_check_url') or DEFAULTS['port_check_url'])
+    text = fetch_text(template.replace('{port}', str(int(port))))
+    if text is None:
+        return None
+    text = text.strip()
+    return True if text == '1' else False if text == '0' else None
+
+
+def port_check_if_due(cfg, state, now=None):
+    """Optional internet check of the forwarded port. Warns only, never changes anything.
+    Starts 2 minutes after a new port; "closed" is reported after two closed answers in a row;
+    an unreachable check service is never reported as closed."""
+    if not cfg.get('port_check'):
+        return
+    cyc = state.cycle
+    if not cyc or not cyc['in_sync'] or not cyc['forwarded_port']:
+        state.port_closed_count = 0
+        return
+    now = time.time() if now is None else now
+    port = int(cyc['forwarded_port'])
+    if state.port_checked_port != port:
+        state.port_checked_port = port
+        state.port_reachable = None
+        state.port_closed_count = 0
+        state.next_port_check = now + 120
+    if state.next_port_check is None:
+        state.next_port_check = now + 120
+    if now < state.next_port_check:
+        return
+    try:
+        minutes = max(5, int(cfg.get('port_check_minutes') or 30))
+    except (TypeError, ValueError):
+        minutes = 30
+    state.next_port_check = now + minutes * 60
+    result = check_port_reachable(cfg, port)
+    state.port_checked_utc = _iso(now)
+    if result is True:
+        state.port_closed_count = 0
+        state.port_reachable = True
+        log.log(OK_LEVEL, 'Port %d is reachable from the internet.', port)
+    elif result is False:
+        state.port_closed_count += 1
+        if state.port_closed_count >= 2:
+            state.port_reachable = False
+            log.warning('Port %d looks CLOSED from the internet. Check that qBittorrent is running and not '
+                        'blocked by a firewall, and that you are on a P2P server with port forwarding on.', port)
+            state.next_port_check = now + 300       # look again soon so the status recovers quickly
+        else:
+            state.next_port_check = now + 120
+    else:
+        log.info('Port check service gave no usable answer; will try again later.')
+
+
+def gather_snapshot(cfg):
+    """Everything `status` and `support-bundle` report on (talks to the VPN gateway and qBittorrent)."""
+    gw, gp = cfg['nat_pmp_gateway'], int(cfg['nat_pmp_port'])
+    snap = {'version': __version__, 'webui_url': cfg['webui_url'], 'vpn_ip': get_public_ip(cfg),
+            'udp': None, 'tcp': None, 'port': None, 'vpn_iface': None,
+            'manage_interface': bool(cfg.get('manage_interface')),
+            'qbt_ok': False, 'qbt_error': '', 'qbt_error_kind': '', 'qbt_port': None, 'qbt_iface': '',
+            'random_port': False, 'upnp': False, 'in_sync': False, 'port_reachable': None}
+    if snap['vpn_ip']:
+        udp = natpmp_exchange(gw, gp, OP_UDP, 1, 0, NATPMP_LIFETIME)
+        tcp = natpmp_exchange(gw, gp, OP_TCP, 1, 0, NATPMP_LIFETIME)
+        snap['udp'] = udp[1] if udp else None
+        snap['tcp'] = tcp[1] if tcp else None
+        if udp and tcp and udp[1] == tcp[1]:
+            snap['port'] = udp[1]
+    snap['vpn_iface'] = detect_vpn_interface(gw)
+    try:
+        client = Qbt(cfg['webui_url'], cfg['username'], get_password(cfg))
+        client.login()
+        prefs = client.preferences()
+        snap['qbt_ok'] = True
+        snap['qbt_port'] = int(prefs.get('listen_port', 0))
+        snap['qbt_iface'] = prefs.get('current_network_interface', '') or ''
+        snap['random_port'] = bool(prefs.get('random_port'))
+        snap['upnp'] = bool(prefs.get('upnp'))
+        port_ok = snap['port'] is not None and snap['qbt_port'] == snap['port']
+        iface_ok = (not snap['manage_interface']) or (snap['vpn_iface'] is not None
+                                                       and snap['qbt_iface'] == snap['vpn_iface'])
+        snap['in_sync'] = bool(port_ok and iface_ok)
+    except QbtAuthError as exc:
+        snap['qbt_error'], snap['qbt_error_kind'] = str(exc), 'auth'
+    except QbtBanned as exc:
+        snap['qbt_error'], snap['qbt_error_kind'] = str(exc), 'banned'
+    except QbtUnreachable as exc:
+        snap['qbt_error'], snap['qbt_error_kind'] = str(exc), 'unreachable'
+    except (QbtError, ConfigError) as exc:
+        snap['qbt_error'], snap['qbt_error_kind'] = str(exc), 'other'
+    if cfg.get('port_check') and snap['port'] and snap['in_sync']:
+        snap['port_reachable'] = check_port_reachable(cfg, snap['port'])
+    return snap
+
+
+def _item(level, message, hint=''):
+    return {'level': level, 'message': message, 'hint': hint}
+
+
+def health_checks(snap):
+    """Plain-language findings with a fix hint each. Pure: reads the snapshot only."""
+    items = []
+    if not snap['vpn_ip']:
+        items.append(_item('ERROR', 'ProtonVPN does not appear to be connected.',
+                           'Connect Proton VPN to a P2P server.'))
+    elif snap['udp'] is None and snap['tcp'] is None:
+        items.append(_item('WARN', 'The VPN gateway answers, but gave no forwarded port.',
+                           'Turn on Port Forwarding in the Proton VPN app (or use a config with NAT-PMP enabled) '
+                           'and reconnect to a P2P-capable server.'))
+    elif snap['port'] is None:
+        items.append(_item('WARN', 'The gateway returned different or missing ports (UDP=%s, TCP=%s).'
+                           % (snap['udp'], snap['tcp']), 'Reconnect the VPN to get a fresh port.'))
+
+    if not snap['qbt_ok']:
+        kind, msg = snap['qbt_error_kind'], snap['qbt_error']
+        if kind == 'auth':
+            items.append(_item('ERROR', 'qBittorrent rejected the username or password.',
+                               'Run "python3 protonportsync.py setup" again and enter the Web UI password.'))
+        elif kind == 'banned':
+            items.append(_item('ERROR', 'qBittorrent has banned this computer after too many failed logins.',
+                               'Restart qBittorrent (this clears the ban), then check the password with setup.'))
+        elif kind == 'unreachable':
+            items.append(_item('ERROR', 'Cannot reach qBittorrent at %s.' % snap['webui_url'],
+                               'Start qBittorrent and turn on the Web UI (%s > Web UI).' % QBT_OPTIONS))
+        else:
+            items.append(_item('ERROR', 'qBittorrent check failed: %s' % msg,
+                               'Run "python3 protonportsync.py once" and read the log.'))
+    else:
+        if snap['port'] is not None and snap['qbt_port'] == snap['port']:
+            items.append(_item('OK', 'qBittorrent listens on the forwarded port (%d).' % snap['port']))
+        elif snap['port'] is not None:
+            items.append(_item('WARN', 'qBittorrent listens on %s but the VPN forwards %d.' % (snap['qbt_port'], snap['port']),
+                               'The background service corrects this within a cycle. If it does not, check that '
+                               'the service is running and read the log.'))
+        if snap['random_port']:
+            items.append(_item('WARN', 'qBittorrent has "random port" turned on, which overrides the synced port.',
+                               '%s > Connection: turn off "Use random port on each start".' % QBT_OPTIONS))
+        if snap['upnp']:
+            items.append(_item('WARN', 'qBittorrent has UPnP / NAT-PMP port forwarding turned on.',
+                               '%s > Connection: turn off "Use UPnP / NAT-PMP port forwarding from my router" '
+                               '(Proton advises against it).' % QBT_OPTIONS))
+        if snap['manage_interface']:
+            if snap['vpn_iface'] is None:
+                items.append(_item('WARN', 'Could not find the VPN tunnel interface (%s).' % TUNNEL_EXAMPLE,
+                                   'Port sync still works. While connected, run "%s" and report the output.'
+                                   % IFACE_LOOKUP_CMD))
+            elif not snap['qbt_iface']:
+                items.append(_item('WARN', 'qBittorrent is not bound to a network interface yet.',
+                                   'The service sets it to "%s" on its next cycle.' % snap['vpn_iface']))
+            elif snap['qbt_iface'] != snap['vpn_iface']:
+                items.append(_item('WARN', 'qBittorrent is bound to "%s" but the VPN tunnel is "%s".'
+                                   % (snap['qbt_iface'], snap['vpn_iface']),
+                                   'The service switches it on its next cycle.'))
+            else:
+                items.append(_item('OK', 'qBittorrent is bound to the VPN tunnel "%s".' % snap['qbt_iface']))
+        elif not snap['qbt_iface']:
+            items.append(_item('WARN', 'qBittorrent is not bound to a network interface.',
+                               '%s > Advanced > Network interface: pick the VPN tunnel. Otherwise, if the VPN drops, '
+                               'torrents continue over your normal connection.' % QBT_OPTIONS))
+
+    if snap['port_reachable'] is True:
+        items.append(_item('OK', 'The port is reachable from the internet.'))
+    elif snap['port_reachable'] is False:
+        items.append(_item('WARN', 'The port looks closed from the internet.',
+                           'Make sure qBittorrent is running and not blocked by a firewall, and that you are on a '
+                           'P2P server with port forwarding on.'))
+
+    if not [i for i in items if i['level'] in ('WARN', 'ERROR')]:
+        items.append(_item('OK', 'Everything looks fine.'))
+    return items
+
+
+_IPV4 = re.compile(r'\b(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\b')
+
+
+def _mask_ip(match):
+    try:
+        ip = ipaddress.ip_address(match.group(0))
+    except ValueError:
+        return 'x.x.x.x'
+    return match.group(0) if (ip.is_private or ip.is_loopback or ip.is_link_local) else 'x.x.x.x'
+
+
+def mask_text(text):
+    """Remove public IPv4 addresses and the home folder path from text that may be shared."""
+    text = _IPV4.sub(_mask_ip, text or '')
+    home = os.path.expanduser('~')
+    if home and len(home) > 1:
+        text = text.replace(home, '~')
+    return text
+
+
+def masked_config(cfg):
+    copy = dict(cfg)
+    copy['username'] = '(set)' if copy.get('username') else ''
+    try:
+        parsed = urllib.parse.urlparse(str(copy.get('webui_url', '')))
+        if parsed.hostname and parsed.hostname not in ('127.0.0.1', 'localhost', '::1'):
+            copy['webui_url'] = '%s://(remote-host):%s' % (parsed.scheme, parsed.port or '')
+    except ValueError:
+        pass
+    return mask_text(json.dumps(copy, indent=2, sort_keys=True))
+
+
+def health_report(snap, items):
+    lines = ['ProtonPortSync support report - %s UTC' % _iso(time.time()),
+             'Version        : %s (%s)' % (snap['version'], PLATFORM_LABEL),
+             'Python         : %s' % platform.python_version(),
+             'System         : %s' % platform.platform(),
+             'VPN reachable  : %s' % ('yes' if snap['vpn_ip'] else 'no'),
+             'Forwarded port : %s' % (snap['port'] if snap['port'] else 'none'),
+             'VPN interface  : %s' % (snap['vpn_iface'] or 'not found'),
+             'qBittorrent    : %s' % ('port %s' % snap['qbt_port'] if snap['qbt_ok'] else 'error - %s' % snap['qbt_error']),
+             'In sync        : %s' % snap['in_sync'], '', 'Checks']
+    for item in items:
+        lines.append('  [%s] %s' % (item['level'], item['message']))
+        if item['hint']:
+            lines.append('         -> %s' % item['hint'])
+    return mask_text('\n'.join(lines) + '\n')
+
+
+def _tail(path, count=1000):
+    try:
+        with open(path, 'r', encoding='utf-8', errors='replace') as fh:
+            return ''.join(fh.readlines()[-count:])
+    except OSError:
+        return None
+
+
+def make_support_bundle(cfg, snap, config_path, out_dir):
+    """Zip with report, masked settings, status.json and the recent log. Returns the zip path."""
+    if not out_dir or not os.path.isdir(out_dir):
+        out_dir = os.path.dirname(os.path.abspath(config_path))
+    zip_path = os.path.join(out_dir, 'ProtonPortSync-support-%s.zip' % time.strftime('%Y%m%d-%H%M%S'))
+    entries = [('report.txt', health_report(snap, health_checks(snap))),
+               ('config.json', masked_config(cfg))]
+    status = _tail(status_path(config_path))
+    if status is not None:
+        entries.append(('status.json', mask_text(status)))
+    names = ['ProtonPortSync.log', 'ProtonPortSync.log.1'] + list(EXTRA_LOG_NAMES)
+    for name in names:
+        text = _tail(os.path.join(log_dir(), name))
+        if text is not None:
+            entries.append((name, mask_text(text)))
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for name, text in entries:
+            zf.writestr(name, text)
+    return zip_path
+
+
+def cmd_support_bundle(args):
+    setup_logging(quiet=True)
+    try:
+        cfg = load_config(args.config)
+    except ConfigError as exc:
+        print(exc)
+        return 1
+    snap = gather_snapshot(cfg)
+    desktop = os.path.expanduser('~/Desktop')
+    path = make_support_bundle(cfg, snap, args.config, desktop if os.path.isdir(desktop) else os.path.expanduser('~'))
+    print('\nSupport bundle created: %s' % path)
+    print('It contains the checks, your recent log and your settings without the user name.')
+    print('Public IP addresses and your home folder path are removed. Look inside before sharing,')
+    print('then attach it to a GitHub issue: https://github.com/emperorgr/ProtonPortSync/issues')
+    return 0
 
 
 # --------------------------------------------------------------------------- logging & lock
@@ -671,7 +1077,10 @@ def cmd_once(args):
         print(exc)
         return 1
     log.info('Running single sync cycle (version %s).', __version__)
-    return 0 if sync_cycle(cfg, State(), args.config) else 1
+    state = State()
+    ok = sync_cycle(cfg, state, args.config)
+    write_status(cfg, state, status_path(args.config), force=True)
+    return 0 if ok else 1
 
 
 def cmd_run(args):
@@ -699,6 +1108,13 @@ def cmd_run(args):
         except Exception as exc:               # never let one bad cycle kill the service
             log.error('Unexpected error: %s', exc)
             in_sync = False
+            if state.cycle is not None:
+                state.cycle.update(state='error', error=str(exc))
+        try:
+            port_check_if_due(cfg, state)
+            write_status(cfg, state, status_path(args.config))
+        except Exception as exc:
+            log.warning('Status/port-check step failed: %s', exc)
         if time.time() - last_heartbeat >= HEARTBEAT_SECONDS:
             last_heartbeat = time.time()
             log.info('Heartbeat: service alive, %s (port %s)',
@@ -710,6 +1126,16 @@ def cmd_run(args):
         time.sleep(wait)
 
 
+def service_status_line():
+    if not shutil.which('systemctl'):
+        return None
+    rc, out = run_command(['systemctl', '--user', 'is-active', SERVICE_NAME])
+    text = out.strip()
+    if text == 'active':
+        return 'running (systemd)'
+    return 'installed but %s' % (text or 'not running') if os.path.exists(unit_path()) else 'not installed'
+
+
 def cmd_status(args):
     try:
         cfg = load_config(args.config)
@@ -717,40 +1143,30 @@ def cmd_status(args):
         print(exc)
         return 1
     setup_logging(quiet=True)
+    snap = gather_snapshot(cfg)
     print()
-    print('  ProtonVPN -> qBittorrent status (Linux %s)' % __version__)
+    print('  ProtonVPN -> qBittorrent status (%s %s)' % (PLATFORM_LABEL, __version__))
     print('  ' + '-' * 40)
-    ip = get_public_ip(cfg)
-    print('  VPN reachable      : %s' % ('yes (%s)' % ip if ip else 'no'))
-    port = None
-    if ip:
-        gw, gp = cfg['nat_pmp_gateway'], int(cfg['nat_pmp_port'])
-        udp = natpmp_exchange(gw, gp, OP_UDP, 1, 0, NATPMP_LIFETIME)
-        tcp = natpmp_exchange(gw, gp, OP_TCP, 1, 0, NATPMP_LIFETIME)
-        print('  Forwarded port     : UDP=%s TCP=%s' % (udp[1] if udp else 'none', tcp[1] if tcp else 'none'))
-        if udp and tcp and udp[1] == tcp[1]:
-            port = udp[1]
-    iface = detect_vpn_interface(cfg['nat_pmp_gateway'])
-    print('  VPN interface      : %s' % (iface or 'not found'))
-    try:
-        client = Qbt(cfg['webui_url'], cfg['username'], get_password(cfg))
-        client.login()
-        prefs = client.preferences()
-        q_port = int(prefs.get('listen_port', 0))
-        q_iface = prefs.get('current_network_interface', '') or '(any)'
-        print('  qBittorrent port   : %d' % q_port)
-        print('  qBittorrent iface  : %s' % q_iface)
-        port_ok = port is not None and q_port == port
-        iface_ok = (not cfg['manage_interface']) or (iface is not None and prefs.get('current_network_interface') == iface)
-        print('  Sync               : %s' % ('IN SYNC' if port_ok and iface_ok else 'OUT OF SYNC'))
-    except (QbtError, ConfigError) as exc:
-        print('  qBittorrent        : error - %s' % exc)
-    if shutil.which('systemctl'):
-        rc, out = run_command(['systemctl', '--user', 'is-active', SERVICE_NAME])
-        text = out.strip()
-        print('  Background service : %s' % (
-            'running (systemd)' if text == 'active' else
-            'installed but %s' % text if os.path.exists(unit_path()) else 'not installed'))
+    print('  VPN reachable      : %s' % ('yes (%s)' % snap['vpn_ip'] if snap['vpn_ip'] else 'no'))
+    if snap['vpn_ip']:
+        print('  Forwarded port     : UDP=%s TCP=%s' % (snap['udp'] if snap['udp'] else 'none',
+                                                      snap['tcp'] if snap['tcp'] else 'none'))
+    print('  VPN interface      : %s' % (snap['vpn_iface'] or 'not found'))
+    if snap['qbt_ok']:
+        print('  qBittorrent port   : %d' % snap['qbt_port'])
+        print('  qBittorrent iface  : %s' % (snap['qbt_iface'] or '(any)'))
+        print('  Sync               : %s' % ('IN SYNC' if snap['in_sync'] else 'OUT OF SYNC'))
+    else:
+        print('  qBittorrent        : error - %s' % snap['qbt_error'])
+    service = service_status_line()
+    if service:
+        print('  Background service : %s' % service)
+    print()
+    print('  Checks')
+    for item in health_checks(snap):
+        print('  [%-5s] %s' % (item['level'], item['message']))
+        if item['hint']:
+            print('          -> %s' % item['hint'])
     print()
     return 0
 
@@ -886,6 +1302,17 @@ def cmd_setup(args):
         cfg['manage_interface'] = _yes('Bind qBittorrent to the VPN network interface automatically (recommended)?',
                                        cfg['manage_interface'])
 
+    if args.no_port_check:
+        cfg['port_check'] = False
+    elif args.port_check:
+        cfg['port_check'] = True
+    elif interactive and not args.url:
+        print('\n== Port check (optional)')
+        print('Every 30 minutes ProtonPortSync can ask a public web service (portcheck.transmissionbt.com)')
+        print('whether your forwarded port is really open, and warn you in the log if not. That service')
+        print('sees your VPN IP address and port number. It stays off unless you say yes.')
+        cfg['port_check'] = _yes('Enable the internet port check?', bool(cfg.get('port_check')))
+
     if not args.skip_test:
         print('\n== Testing connection')
         try:
@@ -978,10 +1405,13 @@ def build_parser():
     st.add_argument('--password-stdin', action='store_true', help='read the password from stdin')
     st.add_argument('--no-interface', action='store_true', help='do not manage the qBittorrent network interface')
     st.add_argument('--skip-test', action='store_true')
+    st.add_argument('--port-check', action='store_true', help='turn the internet port check on without asking')
+    st.add_argument('--no-port-check', action='store_true', help='turn the internet port check off without asking')
     st.add_argument('--password-file', action='store_true', help='store the password in a mode-600 file instead of the keyring')
     st.add_argument('--install', action='store_true', help='install the systemd service without asking')
     st.add_argument('--no-install', action='store_true', help='do not ask about the service')
     st.set_defaults(func=cmd_setup)
+    sub.add_parser('support-bundle', help='zip with checks, log and settings to attach to a bug report').set_defaults(func=cmd_support_bundle)
     sub.add_parser('version', help='print the version').set_defaults(func=cmd_version)
     sub.add_parser('print-unit', help='print the systemd unit file (debug)').set_defaults(func=cmd_print_unit)
     return parser

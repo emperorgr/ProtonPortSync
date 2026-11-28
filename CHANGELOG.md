@@ -49,6 +49,17 @@
   opcode 2 as TCP. The sync itself was never affected (both must succeed), but the
   `TCP=`/`UDP=` values shown by `-Status` and in log warnings were reversed.
 
+## macOS 0.2.0-beta.1 and Linux 0.2.0-beta.1 - 2026-11-28 (separate from the Windows version)
+
+Same additions as Windows 1.3.0, in both Python versions ([`macos/`](macos/README.md), [`linux/`](linux/README.md)):
+
+- **Checks with fix hints** at the end of `status` (VPN, Port Forwarding, qBittorrent, random port, UPnP, tunnel binding).
+- **`status.json`** next to `config.json` (`"status_file": false` turns it off).
+- **`on_port_change` hook**: your own script runs after a port change; ports passed in `PPS_*` environment variables.
+- **Optional port reachability check** (`port_check`, off by default; `setup` asks, or `--port-check` / `--no-port-check`).
+- **`support-bundle`** command: zip with checks, recent log, settings and status, with user name, public IPs and home path removed.
+- 26 new tests per platform (the hook is tested with real scripts).
+
 ## Linux 0.1.0-beta.1 - 2026-11-26 (separate from the Windows version)
 
 First test build of the Linux version in [`linux/`](linux/README.md). Python 3 standard library

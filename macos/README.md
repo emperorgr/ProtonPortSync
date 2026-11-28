@@ -78,6 +78,45 @@ Steady state is quiet on purpose: a line is written only when something changes,
 heartbeat every 30 minutes. If you installed it, run these from the installed copy:
 `python3 ~/Library/Application\ Support/ProtonPortSync/protonportsync.py status`.
 
+## Status, checks and extras (0.2.0 and newer)
+
+**Checks with fix hints.** `python3 protonportsync.py status` ends with a short list of findings in plain language, each with
+what to do about it: VPN not connected, Port Forwarding off, qBittorrent unreachable / wrong password /
+banned, random port on, UPnP on, qBittorrent not bound to the VPN tunnel, port mismatch. It changes nothing.
+
+**`status.json`.** The service writes `status.json` next to `config.json` (`~/Library/Application Support/ProtonPortSync/`) after every
+change, and at least every 5 minutes. Handy for your own scripts, widgets or monitoring:
+
+```json
+{ "version": "0.2.0-beta.1", "state": "in_sync", "inSync": true, "vpnConnected": true,
+  "forwardedPort": 51820, "qbittorrentPort": 51820, "lastPortChangeUtc": "2026-11-28T09:14:02Z",
+  "lastError": null, "portReachable": null, "portCheckedUtc": null, "updatedUtc": "2026-11-28T09:20:10Z" }
+```
+
+`state` is one of `in_sync`, `vpn_down`, `qbt_unreachable`, `auth_failed`, `qbt_banned`, `error`.
+Turn it off with `"status_file": false` in `config.json`.
+
+**Run your own script when the port changes.** Set `on_port_change` in `config.json` to the full path of
+an executable script or program (or a `.py` file). It runs after qBittorrent has accepted a new port and is
+stopped if it takes longer than 15 seconds. The details arrive as environment variables: `PPS_EVENT`
+(`port_changed`), `PPS_NEW_PORT`, `PPS_OLD_PORT`, `PPS_VERSION`. Make the script executable with `chmod +x`.
+
+```sh
+#!/bin/sh
+echo "$(date) port $PPS_OLD_PORT -> $PPS_NEW_PORT" >> "$HOME/port-changes.txt"
+```
+
+**Optional: is the port really open?** Off by default; `setup` asks (or set `"port_check": true`). Every
+`port_check_minutes` (default 30) the service asks `portcheck.transmissionbt.com` (change it with
+`port_check_url`, `{port}` is replaced) whether your forwarded port answers from the internet. It only
+logs a warning and updates `status.json`; it never changes anything. "Closed" is reported after two closed
+results in a row, and a service that does not answer is never treated as "closed". That service sees your VPN
+IP address and the port number.
+
+**Support bundle.** `python3 protonportsync.py support-bundle` puts a zip on your Desktop (or in your home folder) with the checks, the last
+1000 log lines, `status.json` and your settings. Your user name, public IP addresses and your home folder path
+are removed. Look inside before you share it.
+
 ## Updating to a new build
 
 Settings and your Keychain password are kept outside the download, so you do **not** run
@@ -125,6 +164,10 @@ Mac to confirm. Please report (redact your public/VPN IP addresses):
 5. If something failed: the output of `python3 protonportsync.py status`, the last lines of
    `~/Library/Logs/ProtonPortSync/ProtonPortSync.log`, and the output of
    `route -n get 10.2.0.1` while connected.
+
+New in 0.2: does `support-bundle` produce a zip that looks right and has nothing private in it? Do the
+`status` checks tell you something true (and fix hints that fit your setup)? If you use `on_port_change`,
+did your script run?
 
 Open an [issue](https://github.com/emperorgr/ProtonPortSync/issues) or reply on the Reddit
 thread.
