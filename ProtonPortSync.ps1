@@ -20,6 +20,10 @@
 .PARAMETER Status
     Print current status (detected port, qBittorrent port, VPN state) and exit.
 
+.PARAMETER SupportBundle
+    Create a zip with the log, settings (password removed), status and the health checks,
+    with public IP addresses removed, to attach to a bug report. Saved on your Desktop.
+
 .PARAMETER IntervalSeconds
     Poll interval for the background loop. Default 20.
 
@@ -43,13 +47,14 @@ param(
     [switch]$Once,
     [switch]$Status,
     [switch]$CheckUpdate,
-    [switch]$Update
+    [switch]$Update,
+    [switch]$SupportBundle
 )
 
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security
 
-$script:Version = '1.2.1'
+$script:Version = '1.3.0'
 
 # Self-updater (optional: the engine works without this file).
 $script:InstallDir = $PSScriptRoot
@@ -58,6 +63,17 @@ $updaterPath = Join-Path $PSScriptRoot 'ProtonPortSync.Updater.ps1'
 if (Test-Path -LiteralPath $updaterPath) {
     try { . $updaterPath; $script:UpdaterLoaded = $true } catch { }
 }
+
+# Status file, port-change hook, port check, health checks, support bundle (optional file).
+$script:ToolsLoaded = $false
+$toolsPath = Join-Path $PSScriptRoot 'ProtonPortSync.Tools.ps1'
+if (Test-Path -LiteralPath $toolsPath) {
+    try { . $toolsPath; $script:ToolsLoaded = $true } catch { }
+}
+$script:Cycle = $null
+$script:LastPortChangeUtc = $null
+$script:PortReachable = $null
+$script:PortCheckedUtc = $null
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -75,6 +91,11 @@ function Get-DefaultConfig {
         LastAppliedPort   = 0
         AutoUpdate        = $true         # install new GitHub releases automatically
         UpdateCheckHours  = 6
+        StatusFile        = $true         # write status.json next to config.json
+        OnPortChange      = ''            # full path of a .ps1/.cmd/.bat/.exe to run after a port change
+        PortCheck         = $false        # opt-in: ask an internet service if the port is really open
+        PortCheckUrl      = 'https://portcheck.transmissionbt.com/{port}'
+        PortCheckMinutes  = 30
     }
 }
 
@@ -428,6 +449,7 @@ function Get-QbtListenPort {
         RandomPort = [bool]$prefs.random_port
         Upnp       = [bool]$prefs.upnp
         NatPmp     = ([bool]$prefs.PSObject.Properties['natpmp'] -and [bool]$prefs.natpmp)
+        Interface  = $(if ($null -ne $prefs.PSObject.Properties['current_network_interface']) { [string]$prefs.current_network_interface } else { '' })
     }
 }
 
@@ -446,11 +468,18 @@ function Set-QbtListenPort {
 function Invoke-SyncCycle {
     param($Config)
 
+    $script:Cycle = [pscustomobject]@{
+        State = 'starting'; InSync = $false; VpnConnected = $false
+        VpnPort = $null; QbtPort = $null; Error = $null
+    }
     $found = Get-ProtonReservedPort -Config $Config
     if (-not $found) {
+        $script:Cycle.State = 'vpn_down'
         Write-Log 'No ProtonVPN port announcement found - is the VPN connected?' 'WARN'
         return $false
     }
+    $script:Cycle.VpnConnected = $true
+    $script:Cycle.VpnPort = $found.Port
 
     $age = [int](([datetime]::UtcNow) - $found.TimestampUtc).TotalSeconds
     $fresh = ($age -ge -120 -and $age -le 300)   # Proton re-announces every ~60s
@@ -460,6 +489,7 @@ function Invoke-SyncCycle {
 
     if (-not $verify.Ok) {
         if (-not $fresh) {
+            $script:Cycle.State = 'port_unverified'
             Write-Log ("Port {0} could not be verified (TCP={1} UDP={2}) and the log entry is {3}s old. Skipping." -f
                        $found.Port, $verify.Tcp, $verify.Udp, $age) 'WARN'
             return $false
@@ -479,7 +509,11 @@ function Invoke-SyncCycle {
     # Resume only once config.json has been changed (e.g. Setup re-run).
     if ($script:AuthFailedStamp) {
         $stamp = (Get-Item -LiteralPath $ConfigPath -ErrorAction SilentlyContinue).LastWriteTimeUtc
-        if ($stamp -eq $script:AuthFailedStamp) { return $false }
+        if ($stamp -eq $script:AuthFailedStamp) {
+            $script:Cycle.State = 'auth_failed'
+            $script:Cycle.Error = 'qBittorrent rejected the username or password.'
+            return $false
+        }
         $script:AuthFailedStamp = $null
         Write-Log 'Configuration changed; retrying qBittorrent login.'
     }
@@ -500,6 +534,7 @@ function Invoke-SyncCycle {
             Write-Log 'qBittorrent has "random_port" enabled - it may override this sync. Consider disabling it.' 'WARN'
         }
 
+        $script:Cycle.QbtPort = $current.ListenPort
         if ($current.ListenPort -eq $found.Port) {
             Write-Log ("qBittorrent already listens on {0}; nothing to do." -f $found.Port) 'OK'
         }
@@ -509,8 +544,16 @@ function Invoke-SyncCycle {
             $after = Get-QbtListenPort -Qbt $qbt
             if ($after.ListenPort -eq $found.Port) {
                 Write-Log ("Updated qBittorrent listen_port {0} -> {1}" -f $current.ListenPort, $found.Port) 'OK'
+                $script:Cycle.QbtPort = $after.ListenPort
+                $script:LastPortChangeUtc = [datetime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
+                if ($script:ToolsLoaded) {
+                    try { Invoke-PortChangeHook -Config $Config -OldPort $current.ListenPort -NewPort $found.Port } catch { }
+                }
             }
             else {
+                $script:Cycle.State = 'error'
+                $script:Cycle.QbtPort = $after.ListenPort
+                $script:Cycle.Error = "qBittorrent did not accept the new port (still $($after.ListenPort))."
                 Write-Log ("qBittorrent did not accept the new port (still {0})." -f $after.ListenPort) 'ERROR'
                 return $false
             }
@@ -520,16 +563,22 @@ function Invoke-SyncCycle {
             $Config.LastAppliedPort = $found.Port
             Save-Config -Config $Config
         }
+        $script:Cycle.State = 'in_sync'
+        $script:Cycle.InSync = $true
         return $true
     }
     catch {
         $msg = $_.Exception.Message
+        $script:Cycle.Error = $msg
+        $script:Cycle.State = 'error'
         if ($msg -match 'banned') {
+            $script:Cycle.State = 'qbt_banned'
             # Do not hammer the endpoint: stay away for 5 minutes.
             $script:BanBackoffUntil = (Get-Date).AddMinutes(5)
             Write-Log $msg 'ERROR'
         }
         elseif ($msg -match 'rejected the username') {
+            $script:Cycle.State = 'auth_failed'
             $script:AuthFailedStamp = (Get-Item -LiteralPath $ConfigPath -ErrorAction SilentlyContinue).LastWriteTimeUtc
             Write-Log ($msg + ' Not retrying until the configuration changes - re-run ProtonPortSync.Setup.ps1.') 'ERROR'
         }
@@ -537,6 +586,7 @@ function Invoke-SyncCycle {
             Write-Log $msg 'ERROR'
         }
         elseif ($msg -match 'unreachable|Unable to connect|refused|timed out') {
+            $script:Cycle.State = 'qbt_unreachable'
             Write-Log $msg 'WARN'
         }
         else {
@@ -550,36 +600,75 @@ function Invoke-SyncCycle {
 # Entry point
 # ---------------------------------------------------------------------------
 
-function Show-Status {
+function Get-StatusSnapshot {
+    <# Gathers everything -Status and -SupportBundle report on (talks to the VPN gateway and qBittorrent). #>
     param($Config)
     $found = Get-ProtonReservedPort -Config $Config
-    $vpnIp = Get-VpnPublicIp -Config $Config
+    $snap = [pscustomobject]@{
+        Version = $script:Version; VpnIp = (Get-VpnPublicIp -Config $Config)
+        Found = $found; AgeSec = $null; Verify = $null
+        QbtOk = $false; QbtError = $null; QbtPort = $null
+        RandomPort = $false; Upnp = $false; Iface = ''
+        PortReachable = $script:PortReachable; InSync = $false
+    }
+    if ($found) {
+        $snap.AgeSec = [int](([datetime]::UtcNow) - $found.TimestampUtc).TotalSeconds
+        $snap.Verify = Test-PortForwarded -Config $Config -Port $found.Port
+    }
+    try {
+        $qbt = New-QbtSession -Config $Config
+        $cur = Get-QbtListenPort -Qbt $qbt
+        $snap.QbtOk = $true
+        $snap.QbtPort = $cur.ListenPort
+        $snap.RandomPort = $cur.RandomPort
+        $snap.Upnp = $cur.Upnp
+        $snap.Iface = $cur.Interface
+        $snap.InSync = [bool]($found -and $cur.ListenPort -eq $found.Port)
+    } catch {
+        $snap.QbtError = $_.Exception.Message
+    }
+    if ($script:ToolsLoaded -and $Config.PortCheck -and $found -and $snap.InSync) {
+        $snap.PortReachable = Test-PortReachable -Config $Config -Port $found.Port
+    }
+    return $snap
+}
+
+function Show-Status {
+    param($Config)
+    $snap = Get-StatusSnapshot -Config $Config
+    $found = $snap.Found
 
     Write-Host ''
     Write-Host '  ProtonVPN -> qBittorrent status' -ForegroundColor Cyan
     Write-Host '  --------------------------------'
     Write-Host ("  Version            : {0} (auto-update {1})" -f $script:Version,
         $(if (-not $script:UpdaterLoaded) { 'unavailable' } elseif ($Config.AutoUpdate) { 'on' } else { 'off' }))
-    Write-Host ("  VPN reachable      : {0}" -f $(if ($vpnIp) { "yes ($vpnIp)" } else { 'no' }))
+    Write-Host ("  VPN reachable      : {0}" -f $(if ($snap.VpnIp) { "yes ($($snap.VpnIp))" } else { 'no' }))
     if ($found) {
-        $age = [int](([datetime]::UtcNow) - $found.TimestampUtc).TotalSeconds
-        $verify = Test-PortForwarded -Config $Config -Port $found.Port
-        Write-Host ("  VPN forwarded port : {0} (log age {1}s, internal {2})" -f $found.Port, $age, $found.InternalPort)
-        Write-Host ("  NAT-PMP confirm    : TCP={0} UDP={1}" -f $verify.Tcp, $verify.Udp)
+        Write-Host ("  VPN forwarded port : {0} (log age {1}s, internal {2})" -f $found.Port, $snap.AgeSec, $found.InternalPort)
+        Write-Host ("  NAT-PMP confirm    : TCP={0} UDP={1}" -f $snap.Verify.Tcp, $snap.Verify.Udp)
     } else {
         Write-Host '  VPN forwarded port : not found'
     }
-    try {
-        $qbt = New-QbtSession -Config $Config
-        $cur = Get-QbtListenPort -Qbt $qbt
-        Write-Host ("  qBittorrent port   : {0}" -f $cur.ListenPort)
-        if ($found -and $cur.ListenPort -eq $found.Port) {
+    if ($snap.QbtOk) {
+        Write-Host ("  qBittorrent port   : {0}" -f $snap.QbtPort)
+        if ($snap.InSync) {
             Write-Host '  Sync               : IN SYNC' -ForegroundColor Green
         } else {
             Write-Host '  Sync               : OUT OF SYNC' -ForegroundColor Yellow
         }
-    } catch {
-        Write-Host ("  qBittorrent        : error - {0}" -f $_.Exception.Message) -ForegroundColor Red
+    } else {
+        Write-Host ("  qBittorrent        : error - {0}" -f $snap.QbtError) -ForegroundColor Red
+    }
+
+    if ($script:ToolsLoaded) {
+        Write-Host ''
+        Write-Host '  Checks' -ForegroundColor Cyan
+        foreach ($item in (Get-HealthChecks -Snap $snap -Config $Config)) {
+            $color = switch ($item.Level) { 'OK' { 'Green' } 'WARN' { 'Yellow' } 'ERROR' { 'Red' } default { 'Gray' } }
+            Write-Host ("  [{0,-5}] {1}" -f $item.Level, $item.Message) -ForegroundColor $color
+            if ($item.Hint) { Write-Host ("          -> {0}" -f $item.Hint) -ForegroundColor DarkGray }
+        }
     }
     Write-Host ''
 }
@@ -590,6 +679,21 @@ function Invoke-Main {
 
         if ($Status) {
             Show-Status -Config $config
+            return
+        }
+
+        if ($SupportBundle) {
+            if (-not $script:ToolsLoaded) {
+                Write-Host 'ProtonPortSync.Tools.ps1 is not present in this folder.' -ForegroundColor Yellow
+                return $false
+            }
+            $snap = Get-StatusSnapshot -Config $config
+            $zip = New-SupportBundle -Config $config -Snap $snap -ConfigPath $ConfigPath -OutDir ([Environment]::GetFolderPath('Desktop'))
+            Write-Host ''
+            Write-Host "Support bundle created: $zip" -ForegroundColor Green
+            Write-Host 'It contains your recent log, settings without the password, and the health checks.'
+            Write-Host 'Public IP addresses and your Windows user name are removed. Look inside before sharing,'
+            Write-Host 'then attach it to a GitHub issue: https://github.com/emperorgr/ProtonPortSync/issues'
             return
         }
 
@@ -611,7 +715,9 @@ function Invoke-Main {
 
         if ($Once) {
             Write-Log 'Running single sync cycle.'
-            return (Invoke-SyncCycle -Config $config)
+            $onceResult = Invoke-SyncCycle -Config $config
+            if ($script:ToolsLoaded) { try { Write-StatusFile -Config $config -Cycle $script:Cycle -Path (Get-StatusFilePath -ConfigPath $ConfigPath) -Force } catch { } }
+            return $onceResult
         }
 
         # --- background loop -----------------------------------------------
@@ -659,6 +765,12 @@ function Invoke-Main {
         while ($true) {
             try { $config = Get-Config } catch { }   # keep the last good config if the file is mid-write
             $inSync = Invoke-SyncCycle -Config $config
+            if ($script:ToolsLoaded) {
+                try {
+                    Invoke-PortCheckIfDue -Config $config -Cycle $script:Cycle
+                    Write-StatusFile -Config $config -Cycle $script:Cycle -Path (Get-StatusFilePath -ConfigPath $ConfigPath)
+                } catch { }
+            }
 
             # A freshly installed version is confirmed once it has stayed up for 3 minutes.
             if ($updatePending -and (((Get-Date) - $startedAt).TotalMinutes -ge 3)) {

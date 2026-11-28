@@ -181,6 +181,9 @@ See [CHANGELOG.md](CHANGELOG.md) for what changed in each version.
 
 # custom poll interval (seconds, default 20)
 .\ProtonPortSync.ps1 -IntervalSeconds 30
+
+# zip with logs and settings (secrets removed) to attach to a bug report
+.\ProtonPortSync.ps1 -SupportBundle
 ```
 
 Log file: `%LOCALAPPDATA%\ProtonPortSync\ProtonPortSync.log` (auto-rotates at 1 MB).
@@ -188,6 +191,48 @@ Config:   `%LOCALAPPDATA%\ProtonPortSync\config.json`.
 
 Steady state is silent on purpose (no repeated lines). A heartbeat is written every
 30 minutes so "no output" never looks like a dead service.
+
+## Status, checks and extras (version 1.3.0 and newer)
+
+**Checks with fix hints.** `-Status` now ends with a short list of findings in plain language,
+each with what to do about it, for example *"qBittorrent is not bound to a network interface"*
+(a leak risk if the VPN drops), *"random port is turned on"*, *"the VPN is connected but Proton has
+not announced a forwarded port"* (Port Forwarding is off in the Proton app), or *"cannot reach
+qBittorrent"* (Web UI switched off). It changes nothing.
+
+**`status.json`.** After every change the service writes `%LOCALAPPDATA%\ProtonPortSync\status.json`
+(at least every 5 minutes), handy for your own scripts, widgets or monitoring:
+
+```json
+{ "version": "1.3.0", "state": "in_sync", "inSync": true, "vpnConnected": true,
+  "forwardedPort": 51820, "qbittorrentPort": 51820, "lastPortChangeUtc": "2026-11-28T09:14:02Z",
+  "lastError": null, "portReachable": null, "portCheckedUtc": null, "updatedUtc": "2026-11-28T09:20:10Z" }
+```
+
+`state` is one of `in_sync`, `vpn_down`, `qbt_unreachable`, `auth_failed`, `qbt_banned`,
+`port_unverified`, `error`. Turn it off with `"StatusFile": false` in `config.json`.
+
+**Run your own script when the port changes.** Set `OnPortChange` in `config.json` to the full path
+of a `.ps1`, `.cmd`, `.bat` or `.exe` file (use `\\` or `/` in JSON paths). It runs hidden, after qBittorrent has
+accepted a new port, and is stopped if it takes longer than 15 seconds. The details arrive as
+environment variables: `PPS_EVENT` (`port_changed`), `PPS_NEW_PORT`, `PPS_OLD_PORT`, `PPS_VERSION`.
+Example `notify.cmd`:
+
+```bat
+@echo off
+echo %date% %time% port %PPS_OLD_PORT% -^> %PPS_NEW_PORT% >> "%USERPROFILE%\port-changes.txt"
+```
+
+**Optional: is the port really open?** Off by default. Setup asks, or set `"PortCheck": true`. Every
+`PortCheckMinutes` (default 30) the service asks `portcheck.transmissionbt.com` (change it with
+`PortCheckUrl`, `{port}` is replaced) whether your forwarded port answers from the internet. It only
+logs a warning and updates `status.json`; it never changes anything. "Closed" is reported after two
+closed results in a row, and a service that does not answer is never treated as "closed". Note that
+this service sees your VPN IP address and the port number.
+
+**Support bundle.** `.\ProtonPortSync.ps1 -SupportBundle` puts a zip on your Desktop with the checks,
+the last 1000 log lines, `status.json` and your settings. The password, your user name, public IP
+addresses and your Windows profile path are removed. Look inside before you share it.
 
 ## Behaviour in each situation
 
@@ -230,6 +275,8 @@ its Web UI and never touches its files or folder.
 .\Test-Detection.ps1   # log parsing, NAT-PMP confirm, bogus-port rejection, status
 .\Test-E2E-Mock.ps1    # full push against a mock qBittorrent WebAPI + idempotency
 .\Test-RealClient.ps1  # sets listen_port=40000 on the real client, then restores it
+.\Test-Updater.ps1     # self-updater against a fake GitHub (-Live also checks the real one)
+.\Test-Tools.ps1       # status.json, OnPortChange hook, port check, health checks, support bundle
 ```
 
 Sample passing output:

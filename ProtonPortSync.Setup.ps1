@@ -25,7 +25,9 @@ param(
     [switch]$RegisterStartup,
     [switch]$SkipTest,
     [switch]$AutoUpdate,      # turn automatic updates on without asking
-    [switch]$NoAutoUpdate     # turn automatic updates off without asking
+    [switch]$NoAutoUpdate,    # turn automatic updates off without asking
+    [switch]$PortCheck,       # turn the internet port check on without asking
+    [switch]$NoPortCheck      # turn the internet port check off without asking
 )
 
 $ErrorActionPreference = 'Stop'
@@ -140,6 +142,33 @@ else {
     else                                { $autoUpdate = $autoUpdateDefault }
 }
 
+# --- optional port check ---------------------------------------------------
+$previousConfig = $null
+if (Test-Path -LiteralPath $ConfigPath) {
+    try { $previousConfig = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json } catch { }
+}
+$portCheckDefault = $false
+if ($previousConfig -and $null -ne $previousConfig.PSObject.Properties['PortCheck']) {
+    $portCheckDefault = [bool]$previousConfig.PortCheck
+}
+if ($NoPortCheck) {
+    $portCheck = $false
+}
+elseif ($PortCheck) {
+    $portCheck = $true
+}
+else {
+    Write-Step 'Port check (optional)'
+    Write-Host 'ProtonPortSync can ask a public web service (portcheck.transmissionbt.com) every 30 minutes'
+    Write-Host 'whether your forwarded port is really open from the internet, and warn you in the log if not.'
+    Write-Host 'That service sees your VPN IP address and port number. It is off unless you say yes.'
+    $hint = if ($portCheckDefault) { 'Y/n' } else { 'y/N' }
+    $answer = Read-Host "Enable the internet port check? [$hint]"
+    if     ($answer -match '^(y|yes)$') { $portCheck = $true }
+    elseif ($answer -match '^(n|no)$')  { $portCheck = $false }
+    else                                { $portCheck = $portCheckDefault }
+}
+
 # --- persist ---------------------------------------------------------------
 Write-Step 'Saving configuration'
 $blob = [Security.Cryptography.ProtectedData]::Protect(
@@ -156,6 +185,18 @@ $config = [pscustomobject]@{
     LastAppliedPort   = 0
     AutoUpdate        = $autoUpdate
     UpdateCheckHours  = 6
+    StatusFile        = $true
+    OnPortChange      = ''
+    PortCheck         = $portCheck
+    PortCheckUrl      = 'https://portcheck.transmissionbt.com/{port}'
+    PortCheckMinutes  = 30
+}
+# Keep settings the user edited by hand (OnPortChange, PortCheckMinutes, ...) when Setup is re-run.
+if ($previousConfig) {
+    foreach ($key in 'StatusFile', 'OnPortChange', 'PortCheckUrl', 'PortCheckMinutes', 'UpdateCheckHours',
+                     'IntervalSeconds', 'NatPmpGateway', 'NatPmpPort') {
+        if ($null -ne $previousConfig.PSObject.Properties[$key]) { $config.$key = $previousConfig.$key }
+    }
 }
 
 $dir = Split-Path -Parent $ConfigPath

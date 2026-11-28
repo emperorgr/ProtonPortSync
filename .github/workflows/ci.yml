@@ -47,6 +47,10 @@ jobs:
         shell: powershell
         run: .\Test-Updater.ps1
 
+      - name: Tools tests (status file, hook, port check, health checks, support bundle)
+        shell: powershell
+        run: .\Test-Tools.ps1
+
       - name: Updater tests against the real GitHub releases
         shell: powershell
         run: .\Test-Updater.ps1 -Live

@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.3.0 - 2026-11-28
+
+### Added
+- **Checks with fix hints.** `-Status` lists problems in plain language with what to do about
+  each: VPN not connected, Port Forwarding off, qBittorrent unreachable / wrong password / banned,
+  random port on, UPnP on, qBittorrent **not bound to a network interface** (leak risk), port mismatch.
+- **`status.json`** next to `config.json`, rewritten on every change (and at least every 5 minutes),
+  for scripts and monitoring. Turn off with `"StatusFile": false`.
+- **`OnPortChange` hook.** Run your own `.ps1`/`.cmd`/`.bat`/`.exe` after a port change; the ports are
+  passed in `PPS_*` environment variables; 15 second limit.
+- **Optional port reachability check** (`PortCheck`, off by default; Setup asks). Warns in the log when
+  the forwarded port looks closed from the internet; an unavailable check service is never read as "closed".
+- **`-SupportBundle`**: zip with checks, recent log, settings and status, with the password, user name,
+  public IPs and profile path removed.
+- Setup keeps hand-edited settings (`OnPortChange`, `PortCheckMinutes`, ...) when re-run.
+- New file `ProtonPortSync.Tools.ps1` (picked up by the auto-updater) and `Test-Tools.ps1` (run in CI).
+
 ## 1.2.1 - 2026-11-25
 
 ### Fixed
